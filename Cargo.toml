@@ -38,7 +38,7 @@ pbjson = { version = "0.7", optional = true }
 pin-project = "1.1.5"
 prost = { version = "0.13.3", optional = true }
 regex = "1.10.5"
-rocksdb = "0.21"
+rocksdb = "0.24"
 serde = { version = "1", optional = true}
 sha2 = "0.10"
 smallvec = { version = "1.10", features = ["union", "const_generics"] }
