@@ -87,7 +87,7 @@ pub use write::StateWrite;
 pub use write_batch::StagedWriteBatch;
 // We expose internals to facilitate downstreams
 // building debug tooling.
-pub use store::substore::{DbNodeKey, VersionedKeyHash};
+pub use store::substore::{DbNodeKey, SubstoreConfig, VersionedKeyHash};
 
 // Pruning support
 pub use prune::{prune_main_substore, prune_substore, PruneConfig, PruneMode, PruneReport};
