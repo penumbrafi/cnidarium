@@ -343,4 +343,77 @@ mod tests {
         };
         assert!(config.validate().is_err());
     }
+
+    /// Verified pruning must REJECT a store whose value column family has been
+    /// tampered with: the leaf the iterator yields no longer hashes to the value
+    /// committed under the root, so the per-chunk range proof fails.
+    ///
+    /// This is the regression guard for the safety property. It goes red if the
+    /// range-proof verification is ever weakened or removed (pruning would then
+    /// silently accept the corrupted state).
+    #[tokio::test]
+    async fn prune_rejects_tampered_value() -> anyhow::Result<()> {
+        use crate::{StateDelta, StateRead, StateWrite};
+
+        let tmp_old = tempfile::tempdir()?;
+        let tmp_new = tempfile::tempdir()?;
+        let prefixes: Vec<String> = vec![];
+
+        let storage = Storage::load(tmp_old.path().to_path_buf(), prefixes.clone()).await?;
+
+        // A few keys across several versions, rewriting every key on the last
+        // version so its value row sits at the final version.
+        for v in 0..3u64 {
+            let mut delta = StateDelta::new(storage.latest_snapshot());
+            for k in 0..6u64 {
+                delta.put_raw(format!("key_{k:02}"), format!("val_{k}_{v}").into_bytes());
+            }
+            storage.commit(delta).await?;
+        }
+
+        let version = storage.latest_snapshot().version();
+
+        // Corrupt one live value directly in the value column family on disk,
+        // then flush and drop the storage. cnidarium caches the latest snapshot
+        // in memory, so the tamper is only observed after a fresh reopen — which
+        // is exactly the realistic case this guards against (on-disk corruption).
+        {
+            let config = Arc::new(SubstoreConfig::new(""));
+            let db = storage.db();
+            let cf_values = config.cf_jmt_values(&db);
+            let key_hash = KeyHash::with::<sha2::Sha256>(b"key_03");
+            let row = VersionedKeyHash::encode_from_keyhash(&key_hash, &version);
+            db.put_cf(cf_values, row, borsh::to_vec(&Some(b"TAMPERED".to_vec()))?)?;
+            db.flush()?;
+        }
+        storage.release().await;
+
+        // Reopen fresh so the pruner reads the tampered bytes off disk.
+        let storage = Storage::load(tmp_old.path().to_path_buf(), prefixes.clone()).await?;
+        let snapshot = storage.latest_snapshot();
+        let seen = snapshot.get_raw("key_03").await?;
+        assert_eq!(
+            seen.as_deref(),
+            Some(b"TAMPERED".as_ref()),
+            "precondition: the reopened snapshot must observe the tampered value"
+        );
+
+        let new_storage = Storage::load(tmp_new.path().to_path_buf(), prefixes).await?;
+        let result = prune_main_substore(
+            &storage,
+            snapshot,
+            &new_storage,
+            version,
+            &PruneConfig {
+                chunk_size: 2,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "verified pruning must reject a tampered value, but it succeeded"
+        );
+        Ok(())
+    }
 }
