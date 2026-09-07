@@ -90,7 +90,10 @@ pub use write_batch::StagedWriteBatch;
 pub use store::substore::{DbNodeKey, SubstoreConfig, VersionedKeyHash};
 
 // Pruning support
-pub use prune::{prune_main_substore, prune_substore, PruneConfig, PruneMode, PruneReport};
+pub use prune::{
+    copy_column_families, fingerprint_column_family, prune_main_substore, prune_substore,
+    verify_column_families, PruneConfig, PruneMode, PruneReport,
+};
 
 pub mod future;
 

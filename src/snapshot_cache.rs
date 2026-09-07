@@ -58,6 +58,17 @@ impl SnapshotCache {
         Ok(())
     }
 
+    /// Discards every cached [`Snapshot`] and re-seeds the cache with `snapshot`.
+    ///
+    /// Used after an in-place commit, which rewrites data *at* the current
+    /// version instead of appending a new one. Every cached snapshot pins a
+    /// RocksDB snapshot taken before that write, so leaving them in place would
+    /// hand out a view of the database that no longer exists on disk.
+    pub fn reset(&mut self, snapshot: Snapshot) {
+        self.cache.clear();
+        self.cache.push_front(snapshot);
+    }
+
     /// Returns the latest inserted `Snapshot`.
     pub fn latest(&self) -> Snapshot {
         self.cache

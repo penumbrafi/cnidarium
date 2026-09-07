@@ -100,6 +100,21 @@ pub struct PruneReport {
     pub nodes_before: u64,
     /// Number of nodes after pruning.
     pub nodes_after: u64,
+    /// Keys whose JMT leaf commits to a *different* value than the one the read
+    /// path returns at `version`.
+    ///
+    /// A consistent store has none. They appear when something wrote a value row
+    /// without rebuilding the leaf above it -- historically, a migration that
+    /// committed in place and then built the next block's tree from a snapshot
+    /// taken before that in-place write (see `Storage::commit_in_place`).
+    ///
+    /// The pruner reproduces both halves: the rebuilt tree keeps the leaf the
+    /// original tree committed to (so the root hash is unchanged), and the value
+    /// row is overwritten with what the read path returns (so `get_raw` on the
+    /// pruned store answers exactly what it answered on the original). Without
+    /// the override the pruned node would read pre-migration values and diverge
+    /// from the rest of the network.
+    pub value_overrides: Vec<(KeyHash, Option<OwnedValue>)>,
 }
 
 /// A TreeWriter/TreeReader implementation for pruning operations.
@@ -269,6 +284,7 @@ pub fn prune_substore(
     let chunk_size = prune_config.chunk_size;
     let mut chunk: Vec<(KeyHash, OwnedValue)> = Vec::with_capacity(chunk_size);
     let mut keys_processed = 0u64;
+    let mut value_overrides: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
 
     // Creates a tree for range proof generation
     let old_tree = JellyfishMerkleTree::<_, sha2::Sha256>::new(substore_snapshot_arc.as_ref());
@@ -282,6 +298,27 @@ pub fn prune_substore(
 
     for result in iter {
         let (key_hash, value) = result?;
+
+        // `JellyfishMerkleIterator` reads each value at the version of the *leaf
+        // node* it is walking (jmt-0.11 `iterator.rs:296,335`), because that is
+        // the value the leaf's `value_hash` -- and therefore the root hash --
+        // commits to. Reads take a different route: `SubstoreSnapshot::get_jmt`
+        // -> `jmt::tree.get(key, version)` -> `get_value(version, ..)`
+        // (jmt-0.11 `tree.rs:1057`), i.e. the newest value row at or below the
+        // *queried* version. In a consistent store the two agree. When they do
+        // not, the tree must keep the value it commits to, and the read path
+        // must keep answering what it answered before pruning.
+        let read_path_value = substore_snapshot_arc.get_value_option(version, key_hash)?;
+        if read_path_value.as_deref() != Some(value.as_slice()) {
+            tracing::warn!(
+                key_hash = %hex::encode(key_hash.0),
+                leaf_value = %hex::encode(&value),
+                read_value = ?read_path_value.as_ref().map(hex::encode),
+                "jmt leaf and value column family disagree; preserving both"
+            );
+            value_overrides.push((key_hash, read_path_value));
+        }
+
         chunk.push((key_hash, value));
         keys_processed += 1;
 
@@ -306,6 +343,23 @@ pub fn prune_substore(
     }
     restore.finish()?;
 
+    // Re-apply the read-path values on top of the freshly restored value rows.
+    // The nodes are already written, so this changes no hash: it only restores
+    // the read semantics of the source database.
+    if !value_overrides.is_empty() {
+        let cf_jmt_values = config.cf_jmt_values(new_db);
+        let mut batch = rocksdb::WriteBatch::default();
+        for (key_hash, value) in value_overrides.iter() {
+            let key_bytes = VersionedKeyHash::encode_from_keyhash(key_hash, &version);
+            batch.put_cf(cf_jmt_values, key_bytes, borsh::to_vec(value)?);
+        }
+        new_db.write(batch)?;
+        tracing::warn!(
+            count = value_overrides.len(),
+            "restored read-path values for keys whose leaf disagrees with the value column family"
+        );
+    }
+
     // Silence unused variable warning for mode field
     let _ = prune_config.mode;
     let nodes_after = count_nodes(new_db, &config)?;
@@ -316,7 +370,134 @@ pub fn prune_substore(
         keys_processed,
         nodes_before,
         nodes_after,
+        value_overrides,
     })
+}
+
+
+/// Copy every column family named in `cf_names` that is not in `rebuilt`,
+/// preserving key and value bytes exactly.
+///
+/// The pruner rebuilds only the JMT node and value column families of the
+/// substores it prunes. Everything else -- the preimage indices, the
+/// nonverifiable data, the config column, and every column family of every
+/// substore that is not pruned -- has to be carried over unchanged. Taking the
+/// list of column families from the database itself (`rocksdb::DB::list_cf`)
+/// rather than from a hardcoded list means a column family added later cannot
+/// be silently dropped on the floor.
+///
+/// Returns `(column family, entries copied)` for each column family copied.
+pub fn copy_column_families(
+    old_db: &DB,
+    new_db: &DB,
+    cf_names: &[String],
+    rebuilt: &[String],
+) -> Result<Vec<(String, u64)>> {
+    let mut copied = Vec::new();
+    for cf_name in cf_names {
+        if rebuilt.iter().any(|r| r == cf_name) {
+            continue;
+        }
+        let old_cf = old_db.cf_handle(cf_name).ok_or_else(|| {
+            anyhow::anyhow!("column family '{}' not found in old database", cf_name)
+        })?;
+        let new_cf = new_db.cf_handle(cf_name).ok_or_else(|| {
+            anyhow::anyhow!("column family '{}' not found in new database", cf_name)
+        })?;
+
+        let mut count = 0u64;
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut iter = old_db.raw_iterator_cf(old_cf);
+        iter.seek_to_first();
+        while iter.valid() {
+            if let (Some(key), Some(value)) = (iter.key(), iter.value()) {
+                batch.put_cf(new_cf, key, value);
+                count += 1;
+                if count % 10_000 == 0 {
+                    new_db.write(std::mem::take(&mut batch))?;
+                }
+            }
+            iter.next();
+        }
+        iter.status()?;
+        if !batch.is_empty() {
+            new_db.write(batch)?;
+        }
+        tracing::info!(cf_name, count, "copied column family");
+        copied.push((cf_name.clone(), count));
+    }
+    Ok(copied)
+}
+
+/// Entry count and a rolling SHA-256 over every key and value of a column family.
+///
+/// Length-prefixing both key and value keeps the digest injective, so two
+/// different column families cannot collide by re-splitting the same bytes.
+pub fn fingerprint_column_family(db: &DB, cf_name: &str) -> Result<(u64, [u8; 32])> {
+    use sha2::Digest as _;
+
+    let cf = db
+        .cf_handle(cf_name)
+        .ok_or_else(|| anyhow::anyhow!("column family '{}' not found", cf_name))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut count = 0u64;
+    let mut iter = db.raw_iterator_cf(cf);
+    iter.seek_to_first();
+    while iter.valid() {
+        if let (Some(key), Some(value)) = (iter.key(), iter.value()) {
+            hasher.update((key.len() as u64).to_be_bytes());
+            hasher.update(key);
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+            count += 1;
+        }
+        iter.next();
+    }
+    iter.status()?;
+    Ok((count, hasher.finalize().into()))
+}
+
+/// Check that every column family the pruner did not rebuild is identical in
+/// the two databases, and fail with the offending column families otherwise.
+///
+/// This is the guard that makes the directory swap safe: the JMT half of the
+/// output is already covered by the per-chunk range proofs, and this covers
+/// everything else.
+pub fn verify_column_families(
+    old_db: &DB,
+    new_db: &DB,
+    cf_names: &[String],
+    rebuilt: &[String],
+) -> Result<()> {
+    let mut mismatches = Vec::new();
+    for cf_name in cf_names {
+        if rebuilt.iter().any(|r| r == cf_name) {
+            continue;
+        }
+        let (old_count, old_hash) = fingerprint_column_family(old_db, cf_name)?;
+        let (new_count, new_hash) = fingerprint_column_family(new_db, cf_name)?;
+        if old_count != new_count || old_hash != new_hash {
+            mismatches.push(format!(
+                "{cf_name}: {old_count} entries / {} in the source, {new_count} entries / {} in the pruned database",
+                hex::encode(old_hash),
+                hex::encode(new_hash),
+            ));
+        } else {
+            tracing::info!(
+                cf_name,
+                count = old_count,
+                hash = %hex::encode(old_hash),
+                "column family verified"
+            );
+        }
+    }
+    ensure!(
+        mismatches.is_empty(),
+        "pruned database does not match the source in {} column families: {}",
+        mismatches.len(),
+        mismatches.join("; "),
+    );
+    Ok(())
 }
 
 #[cfg(test)]

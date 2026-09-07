@@ -542,8 +542,27 @@ impl Storage {
             "committed main store and substores to db"
         );
 
+        // An in-place commit rewrites data *at* the current version. Every
+        // snapshot in the cache pins a RocksDB snapshot taken before that write,
+        // so they no longer describe the database. They have to be discarded, or
+        // the next `latest_snapshot()` hands out a pre-commit view: writing the
+        // following block from it rebuilds the JMT on the pre-commit tree and
+        // silently reverts part of the migration in the merkle tree while the
+        // value column family keeps the migrated values. That is exactly what
+        // happened to `penumbra-1` at the 12598601 restart fork, where three
+        // keys ended up with a leaf committing to their pre-migration value.
+        //
+        // Subscribers are still not notified: the version has not changed, and
+        // an in-place commit only ever runs offline, in a migration.
+        if perform_migration {
+            tracing::debug!("refreshing snapshot cache after in-place commit");
+            let latest_snapshot = Snapshot::new(db.clone(), version, multistore_versions);
+            self.0.snapshots.write().reset(latest_snapshot);
+            return Ok(global_root_hash);
+        }
+
         // If we're not performing a migration, we should update the snapshot cache
-        if !perform_migration {
+        {
             tracing::debug!("updating snapshot cache");
 
             let latest_snapshot = Snapshot::new(db.clone(), version, multistore_versions);
@@ -563,8 +582,6 @@ impl Storage {
                 .0
                 .dispatcher_tx
                 .send((latest_snapshot, (version, changes)));
-        } else {
-            tracing::debug!("skipping snapshot cache update");
         }
 
         Ok(global_root_hash)
