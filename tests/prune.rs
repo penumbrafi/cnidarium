@@ -305,6 +305,23 @@ async fn test_prune_preserves_read_path_when_leaf_and_value_disagree() -> Result
         "the override must carry the read-path value"
     );
 
+    // The override must be on disk, in the value column family at the pruned
+    // version -- not just visible through a cached snapshot.
+    {
+        let new_db = new_storage.db();
+        let config = cnidarium::SubstoreConfig::new("");
+        let cf_values = config.cf_jmt_values(&new_db);
+        let mut row = key_hash.0.to_vec();
+        row.extend_from_slice(&version.to_be_bytes());
+        let stored: Option<Vec<u8>> =
+            borsh::from_slice(&new_db.get_cf(cf_values, row)?.expect("value row exists"))?;
+        assert_eq!(
+            stored.as_ref(),
+            Some(&post_migration),
+            "the pruned value column family must hold the read-path value on disk"
+        );
+    }
+
     cnidarium::copy_column_families(
         &storage.db(),
         &new_storage.db(),
