@@ -54,6 +54,37 @@ pub enum PruneMode {
     /// Provides verification that the pruned tree matches the original.
     #[default]
     Verified,
+    /// Skip per-chunk range-proof generation and verification. The pruner
+    /// iterates the source JMT at the pinned version, streams leaves in
+    /// sorted-hash order into `JellyfishMerkleTree::put_value_set`, and
+    /// writes the resulting `NodeBatch` directly. The final root hash is
+    /// still compared to the source's original root hash at the end of the
+    /// substore, so a corrupted read from the source will still be detected
+    /// — but the "each chunk is independently proof-verified against a
+    /// range proof" guarantee is dropped.
+    ///
+    /// Trade-off:
+    /// - ~3× faster on penumbra-1 mainnet-scale JMTs (removes the
+    ///   proof-generate + proof-verify round-trip per chunk).
+    /// - Requires the operator to trust the source database. A corrupted
+    ///   source can still produce a matching root at the end (unlikely, but
+    ///   possible in adversarial scenarios), whereas `Verified` catches
+    ///   that per-chunk.
+    ///
+    /// Recommended for operators who trust their own disks and want to
+    /// prune periodically as a maintenance task. Not recommended for
+    /// pruning archives fetched over the network from an unverified source.
+    ///
+    /// Safe practical shape: if the pd home lives on a filesystem that
+    /// supports cheap point-in-time snapshots (ZFS, btrfs, LVM), take a
+    /// snapshot *before* running with this mode. The end-of-substore root
+    /// hash comparison will catch typical failures, but the snapshot lets
+    /// you roll back to the pre-prune state in seconds if anything at all
+    /// looks off after the swap. The `keep-old-db` (default) behaviour
+    /// also gives you `rocksdb_old` for rollback within pd, but a
+    /// filesystem-level snapshot additionally covers cometbft state and
+    /// anything else in the container.
+    Unverified,
 }
 
 /// Configuration for the pruning operation.
@@ -282,66 +313,130 @@ pub fn prune_substore(
     let iter = JellyfishMerkleIterator::new(substore_snapshot_arc.clone(), version, null_root)?;
 
     let chunk_size = prune_config.chunk_size;
-    let mut chunk: Vec<(KeyHash, OwnedValue)> = Vec::with_capacity(chunk_size);
     let mut keys_processed = 0u64;
     let mut value_overrides: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
 
-    // Creates a tree for range proof generation
-    let old_tree = JellyfishMerkleTree::<_, sha2::Sha256>::new(substore_snapshot_arc.as_ref());
+    // `JellyfishMerkleIterator` reads each value at the version of the *leaf
+    // node* it is walking (jmt-0.11 `iterator.rs:296,335`), because that is
+    // the value the leaf's `value_hash` -- and therefore the root hash --
+    // commits to. Reads take a different route: `SubstoreSnapshot::get_jmt`
+    // -> `jmt::tree.get(key, version)` -> `get_value(version, ..)`
+    // (jmt-0.11 `tree.rs:1057`), i.e. the newest value row at or below the
+    // *queried* version. In a consistent store the two agree. When they do
+    // not, the tree must keep the value it commits to, and the read path
+    // must keep answering what it answered before pruning.
+    //
+    // Both prune modes below do the same leaf-vs-value disagreement
+    // detection. The mode only changes how the JMT itself is rebuilt.
+    let detect_disagreement =
+        |key_hash: KeyHash,
+         value: &[u8],
+         overrides: &mut Vec<(KeyHash, Option<OwnedValue>)>|
+         -> Result<()> {
+            let read_path_value = substore_snapshot_arc.get_value_option(version, key_hash)?;
+            if read_path_value.as_deref() != Some(value) {
+                tracing::warn!(
+                    key_hash = %hex::encode(key_hash.0),
+                    leaf_value = %hex::encode(value),
+                    read_value = ?read_path_value.as_ref().map(hex::encode),
+                    "jmt leaf and value column family disagree; preserving both"
+                );
+                overrides.push((key_hash, read_path_value));
+            }
+            Ok(())
+        };
 
-    // A restore instance with verification
-    let mut restore = JellyfishMerkleRestore::<sha2::Sha256>::new(
-        tree_store.clone(),
-        version,
-        original_root_hash,
-    )?;
+    match prune_config.mode {
+        PruneMode::Verified => {
+            // Original path: per-chunk range proof + verified restore.
+            let old_tree =
+                JellyfishMerkleTree::<_, sha2::Sha256>::new(substore_snapshot_arc.as_ref());
+            let mut restore = JellyfishMerkleRestore::<sha2::Sha256>::new(
+                tree_store.clone(),
+                version,
+                original_root_hash,
+            )?;
 
-    for result in iter {
-        let (key_hash, value) = result?;
+            let mut chunk: Vec<(KeyHash, OwnedValue)> = Vec::with_capacity(chunk_size);
+            for result in iter {
+                let (key_hash, value) = result?;
+                detect_disagreement(key_hash, &value, &mut value_overrides)?;
+                chunk.push((key_hash, value));
+                keys_processed += 1;
 
-        // `JellyfishMerkleIterator` reads each value at the version of the *leaf
-        // node* it is walking (jmt-0.11 `iterator.rs:296,335`), because that is
-        // the value the leaf's `value_hash` -- and therefore the root hash --
-        // commits to. Reads take a different route: `SubstoreSnapshot::get_jmt`
-        // -> `jmt::tree.get(key, version)` -> `get_value(version, ..)`
-        // (jmt-0.11 `tree.rs:1057`), i.e. the newest value row at or below the
-        // *queried* version. In a consistent store the two agree. When they do
-        // not, the tree must keep the value it commits to, and the read path
-        // must keep answering what it answered before pruning.
-        let read_path_value = substore_snapshot_arc.get_value_option(version, key_hash)?;
-        if read_path_value.as_deref() != Some(value.as_slice()) {
-            tracing::warn!(
-                key_hash = %hex::encode(key_hash.0),
-                leaf_value = %hex::encode(&value),
-                read_value = ?read_path_value.as_ref().map(hex::encode),
-                "jmt leaf and value column family disagree; preserving both"
+                if chunk.len() == chunk_size {
+                    let rightmost_key = chunk.last().expect("chunk is not empty").0;
+                    let proof = old_tree.get_range_proof(rightmost_key, version)?;
+                    let chunk_data: Vec<_> = chunk.drain(..).collect();
+                    restore.add_chunk(chunk_data, proof)?;
+                    tracing::info!(keys_processed, "processed chunk of keys during pruning");
+                }
+            }
+
+            if !chunk.is_empty() {
+                let rightmost_key = chunk.last().expect("chunk is not empty").0;
+                let proof = old_tree.get_range_proof(rightmost_key, version)?;
+                restore.add_chunk(chunk, proof)?;
+                tracing::info!(
+                    keys_processed,
+                    "processed final chunk of keys during pruning"
+                );
+            }
+            restore.finish()?;
+        }
+        PruneMode::Unverified => {
+            // Trust-the-source path: batch leaves into JellyfishMerkleTree::
+            // put_value_set at the pinned version, write the resulting node
+            // batch. No proof generation, no proof verification per chunk.
+            //
+            // We still compare the final root against the source's original
+            // root at the end of the substore (see below), so a corrupt or
+            // mis-iterated source is caught -- just not per-chunk.
+            let new_tree = JellyfishMerkleTree::<_, sha2::Sha256>::new(tree_store.as_ref());
+
+            let mut chunk: Vec<(KeyHash, Option<OwnedValue>)> = Vec::with_capacity(chunk_size);
+            for result in iter {
+                let (key_hash, value) = result?;
+                detect_disagreement(key_hash, &value, &mut value_overrides)?;
+                chunk.push((key_hash, Some(value)));
+                keys_processed += 1;
+
+                if chunk.len() == chunk_size {
+                    let value_set: Vec<_> = chunk.drain(..).collect();
+                    let (_root, batch) = new_tree.put_value_set(value_set, version)?;
+                    tree_store.write_node_batch(&batch.node_batch)?;
+                    tracing::info!(
+                        keys_processed,
+                        "processed chunk of keys during pruning (unverified)"
+                    );
+                }
+            }
+
+            if !chunk.is_empty() {
+                let (_root, batch) = new_tree.put_value_set(chunk, version)?;
+                tree_store.write_node_batch(&batch.node_batch)?;
+                tracing::info!(
+                    keys_processed,
+                    "processed final chunk of keys during pruning (unverified)"
+                );
+            }
+
+            // End-of-substore root check: cheap safety net that catches
+            // gross iteration or write errors (source flipped a bit, disk
+            // failed a batch). Not equivalent to per-chunk verification —
+            // an adversary who can rewrite the source consistently could
+            // still produce a matching root — but strong enough to catch
+            // the normal failure modes.
+            let final_root =
+                JellyfishMerkleTree::<_, sha2::Sha256>::new(tree_store.as_ref()).get_root_hash(version)?;
+            ensure!(
+                final_root == original_root_hash,
+                "unverified prune: rebuilt root hash {:?} does not match source {:?}",
+                final_root,
+                original_root_hash
             );
-            value_overrides.push((key_hash, read_path_value));
-        }
-
-        chunk.push((key_hash, value));
-        keys_processed += 1;
-
-        if chunk.len() == chunk_size {
-            let rightmost_key = chunk.last().expect("chunk is not empty").0;
-            let proof = old_tree.get_range_proof(rightmost_key, version)?;
-            let chunk_data: Vec<_> = chunk.drain(..).collect();
-            restore.add_chunk(chunk_data, proof)?;
-            tracing::info!(keys_processed, "processed chunk of keys during pruning");
         }
     }
-
-    // Process remaining entries
-    if !chunk.is_empty() {
-        let rightmost_key = chunk.last().expect("chunk is not empty").0;
-        let proof = old_tree.get_range_proof(rightmost_key, version)?;
-        restore.add_chunk(chunk, proof)?;
-        tracing::info!(
-            keys_processed,
-            "processed final chunk of keys during pruning"
-        );
-    }
-    restore.finish()?;
 
     // Re-apply the read-path values on top of the freshly restored value rows.
     // The nodes are already written, so this changes no hash: it only restores
@@ -360,8 +455,6 @@ pub fn prune_substore(
         );
     }
 
-    // Silence unused variable warning for mode field
-    let _ = prune_config.mode;
     let nodes_after = count_nodes(new_db, &config)?;
 
     Ok(PruneReport {
