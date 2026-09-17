@@ -181,6 +181,44 @@ impl<S: StateRead> StateRead for StateDelta<S> {
     type NonconsensusRangeRawStream =
         StateDeltaNonconsensusRangeRawStream<S::NonconsensusRangeRawStream>;
 
+    fn get_raw_bytes(&self, key: &[u8]) -> Self::GetRawFut {
+        // Valid UTF-8 keys live in the string map; see `Cache`.
+        if let Ok(key) = std::str::from_utf8(key) {
+            return self.get_raw(key);
+        }
+
+        if let Some(entry) = self
+            .leaf_cache
+            .read()
+            .as_ref()
+            .expect("delta must not have been applied")
+            .unwritten_bytes_changes
+            .get(key)
+        {
+            return CacheFuture::hit(entry.clone());
+        }
+
+        for layer in self.layers.iter().rev() {
+            if let Some(entry) = layer
+                .read()
+                .as_ref()
+                .expect("delta must not have been applied")
+                .unwritten_bytes_changes
+                .get(key)
+            {
+                return CacheFuture::hit(entry.clone());
+            }
+        }
+
+        CacheFuture::miss(
+            self.state
+                .read()
+                .as_ref()
+                .expect("delta must not have been applied")
+                .get_raw_bytes(key),
+        )
+    }
+
     fn get_raw(&self, key: &str) -> Self::GetRawFut {
         // Check if we have a cache hit in the leaf cache.
         if let Some(entry) = self
@@ -428,6 +466,34 @@ impl<S: StateRead> StateWrite for StateDelta<S> {
             .expect("delta must not have been applied")
             .unwritten_changes
             .insert(key, None);
+    }
+
+    fn put_raw_bytes(&mut self, key: Vec<u8>, value: jmt::OwnedValue) {
+        match String::from_utf8(key) {
+            Ok(key) => self.put_raw(key, value),
+            Err(e) => {
+                self.leaf_cache
+                    .write()
+                    .as_mut()
+                    .expect("delta must not have been applied")
+                    .unwritten_bytes_changes
+                    .insert(e.into_bytes(), Some(value));
+            }
+        }
+    }
+
+    fn delete_bytes(&mut self, key: Vec<u8>) {
+        match String::from_utf8(key) {
+            Ok(key) => self.delete(key),
+            Err(e) => {
+                self.leaf_cache
+                    .write()
+                    .as_mut()
+                    .expect("delta must not have been applied")
+                    .unwritten_bytes_changes
+                    .insert(e.into_bytes(), None);
+            }
+        }
     }
 
     fn nonverifiable_delete(&mut self, key: Vec<u8>) {
