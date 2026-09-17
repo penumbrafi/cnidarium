@@ -195,6 +195,37 @@ impl StateRead for Snapshot {
     type NonconsensusRangeRawStream =
         tokio_stream::wrappers::ReceiverStream<anyhow::Result<(Vec<u8>, Vec<u8>)>>;
 
+    /// Fetch a key from the JMT by raw key bytes.
+    fn get_raw_bytes(&self, key: &[u8]) -> Self::GetRawFut {
+        let span = Span::current();
+        let (key, config) = self.0.multistore_cache.config.route_key_bytes(key);
+
+        let rocksdb_snapshot = self.0.snapshot.clone();
+        let db = self.0.db.clone();
+
+        let version = self
+            .substore_version(&config)
+            .expect("the substore exists and has been initialized");
+
+        let substore = store::substore::SubstoreSnapshot {
+            config,
+            rocksdb_snapshot,
+            version,
+            db,
+        };
+        let key_hash = jmt::KeyHash::with::<sha2::Sha256>(key);
+
+        crate::future::SnapshotFuture(tokio::task::spawn_blocking(move || {
+            span.in_scope(|| {
+                let _start = std::time::Instant::now();
+                let rsp = substore.get_jmt(key_hash);
+                #[cfg(feature = "metrics")]
+                metrics::histogram!(metrics::STORAGE_GET_RAW_DURATION).record(_start.elapsed());
+                rsp
+            })
+        }))
+    }
+
     /// Fetch a key from the JMT.
     fn get_raw(&self, key: &str) -> Self::GetRawFut {
         let span = Span::current();
@@ -304,8 +335,11 @@ impl StateRead for Snapshot {
                 for tuple in jmt_keys_iterator {
                     // For each key that matches the prefix, fetch the value from the JMT column family.
                     let (key_preimage, _) = tuple?;
-                    let substore_key = std::str::from_utf8(key_preimage.as_ref())
-                        .expect("saved jmt keys are utf-8 strings");
+                    // Keys written with `put_raw_bytes` need not be UTF-8;
+                    // they are not visible through the string-typed streams.
+                    let Ok(substore_key) = std::str::from_utf8(key_preimage.as_ref()) else {
+                        continue;
+                    };
                     let key_hash = jmt::KeyHash::with::<sha2::Sha256>(substore_key.as_bytes());
 
                     let full_key = if substore_prefix.is_empty() {
@@ -365,8 +399,9 @@ impl StateRead for Snapshot {
 
                 for key_and_keyhash in iter {
                     let (raw_preimage, _) = key_and_keyhash?;
-                    let preimage = std::str::from_utf8(raw_preimage.as_ref())
-                        .expect("saved jmt keys are utf-8 strings");
+                    let Ok(preimage) = std::str::from_utf8(raw_preimage.as_ref()) else {
+                        continue;
+                    };
 
                     let full_key = if substore_prefix.is_empty() {
                         preimage.to_string()

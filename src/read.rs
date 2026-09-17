@@ -16,6 +16,12 @@ pub trait StateRead: Send + Sync {
     /// Users should generally prefer to use `get` or `get_proto` from an extension trait.
     fn get_raw(&self, key: &str) -> Self::GetRawFut;
 
+    /// Gets a value from the verifiable key-value store by raw key bytes.
+    ///
+    /// For a key that is valid UTF-8 this is identical to `get_raw`; see
+    /// [`StateWrite::put_raw_bytes`](crate::StateWrite::put_raw_bytes).
+    fn get_raw_bytes(&self, key: &[u8]) -> Self::GetRawFut;
+
     /// Gets a byte value from the non-verifiable key-value store.
     ///
     /// This is intended for application-specific indexes of the verifiable
@@ -79,6 +85,10 @@ impl<'a, S: StateRead + Send + Sync> StateRead for &'a S {
         (**self).get_raw(key)
     }
 
+    fn get_raw_bytes(&self, key: &[u8]) -> Self::GetRawFut {
+        (**self).get_raw_bytes(key)
+    }
+
     fn prefix_raw(&self, prefix: &str) -> S::PrefixRawStream {
         (**self).prefix_raw(prefix)
     }
@@ -121,6 +131,10 @@ impl<'a, S: StateRead + Send + Sync> StateRead for &'a mut S {
 
     fn get_raw(&self, key: &str) -> Self::GetRawFut {
         (**self).get_raw(key)
+    }
+
+    fn get_raw_bytes(&self, key: &[u8]) -> Self::GetRawFut {
+        (**self).get_raw_bytes(key)
     }
 
     fn prefix_raw(&self, prefix: &str) -> S::PrefixRawStream {
@@ -167,6 +181,10 @@ impl<S: StateRead + Send + Sync> StateRead for Arc<S> {
         (**self).get_raw(key)
     }
 
+    fn get_raw_bytes(&self, key: &[u8]) -> Self::GetRawFut {
+        (**self).get_raw_bytes(key)
+    }
+
     fn prefix_raw(&self, prefix: &str) -> S::PrefixRawStream {
         (**self).prefix_raw(prefix)
     }
@@ -208,6 +226,10 @@ impl StateRead for () {
         futures::stream::Iter<std::iter::Empty<Result<(Vec<u8>, Vec<u8>)>>>;
     type NonconsensusRangeRawStream =
         futures::stream::Iter<std::iter::Empty<Result<(Vec<u8>, Vec<u8>)>>>;
+
+    fn get_raw_bytes(&self, _key: &[u8]) -> Self::GetRawFut {
+        futures::future::ready(Ok(None))
+    }
 
     fn get_raw(&self, _key: &str) -> Self::GetRawFut {
         futures::future::ready(Ok(None))
