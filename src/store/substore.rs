@@ -382,6 +382,8 @@ impl SubstoreStorage {
                         let unwritten_changes: Vec<_> = cache
                             .unwritten_changes
                             .into_iter()
+                            .map(|(key, some_value)| (key.into_bytes(), some_value))
+                            .chain(cache.unwritten_bytes_changes)
                             .map(|(key, some_value)| (KeyHash::with::<sha2::Sha256>(&key), key, some_value))
                             .collect();
 

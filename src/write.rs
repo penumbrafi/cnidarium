@@ -10,6 +10,22 @@ pub trait StateWrite: StateRead + Send + Sync {
     /// Delete a key from the verifiable key-value store.
     fn delete(&mut self, key: String);
 
+    /// Puts raw bytes into the verifiable key-value store under a key that
+    /// need not be valid UTF-8.
+    ///
+    /// The verifiable store hashes key bytes, so this is the same store as
+    /// [`put_raw`](Self::put_raw): a key that *is* valid UTF-8 is exactly
+    /// equivalent to `put_raw(String::from_utf8(key), value)`, and reads
+    /// through either API agree. Keys that are not valid UTF-8 are invisible
+    /// to the string-typed `prefix_raw` / `prefix_keys` streams; they are
+    /// intended for protocol-fixed paths such as IBC v2 commitment keys,
+    /// which are only ever read by exact key or proved by `get_with_proof`.
+    fn put_raw_bytes(&mut self, key: Vec<u8>, value: Vec<u8>);
+
+    /// Delete a key from the verifiable key-value store; see
+    /// [`put_raw_bytes`](Self::put_raw_bytes).
+    fn delete_bytes(&mut self, key: Vec<u8>);
+
     /// Puts raw bytes into the non-verifiable key-value store with the given key.
     fn nonverifiable_put_raw(&mut self, key: Vec<u8>, value: Vec<u8>);
 
@@ -43,6 +59,14 @@ impl<'a, S: StateWrite + Send + Sync> StateWrite for &'a mut S {
 
     fn delete(&mut self, key: String) {
         (**self).delete(key)
+    }
+
+    fn put_raw_bytes(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        (**self).put_raw_bytes(key, value)
+    }
+
+    fn delete_bytes(&mut self, key: Vec<u8>) {
+        (**self).delete_bytes(key)
     }
 
     fn nonverifiable_delete(&mut self, key: Vec<u8>) {

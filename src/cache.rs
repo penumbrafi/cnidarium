@@ -14,6 +14,13 @@ use crate::{
 pub struct Cache {
     /// Unwritten changes to the consensus-critical state (stored in the JMT).
     pub(crate) unwritten_changes: BTreeMap<String, Option<Vec<u8>>>,
+    /// Unwritten changes to the consensus-critical state whose keys are not
+    /// valid UTF-8 (e.g. IBC v2 commitment paths `clientId || 0x01 || u64_be`).
+    ///
+    /// Invariant: no key in this map is valid UTF-8. Byte-keyed writes with a
+    /// valid UTF-8 key are routed to `unwritten_changes`, so a key has exactly
+    /// one home and string and byte reads agree.
+    pub(crate) unwritten_bytes_changes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     /// Unwritten changes to non-consensus-critical state (stored in the nonverifiable storage).
     pub(crate) nonverifiable_changes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     /// Unwritten changes to the object store.  A `None` value means a deletion.
@@ -26,6 +33,12 @@ impl Cache {
     /// Inspect the cache of unwritten changes to the verifiable state.
     pub fn unwritten_changes(&self) -> &BTreeMap<String, Option<Vec<u8>>> {
         &self.unwritten_changes
+    }
+
+    /// Inspect the cache of unwritten changes to the verifiable state whose
+    /// keys are not valid UTF-8. See [`StateWrite::put_raw_bytes`].
+    pub fn unwritten_bytes_changes(&self) -> &BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        &self.unwritten_bytes_changes
     }
 
     /// Inspect the cache of unwritten changes to the nonverifiable state.
@@ -41,6 +54,8 @@ impl Cache {
         // `StateRead` trait assumes asynchronous access, and in any case, we
         // probably don't want to be reading directly from a `Cache` (?)
         self.unwritten_changes.extend(other.unwritten_changes);
+        self.unwritten_bytes_changes
+            .extend(other.unwritten_bytes_changes);
         self.nonverifiable_changes
             .extend(other.nonverifiable_changes);
         self.ephemeral_objects.extend(other.ephemeral_objects);
@@ -54,6 +69,14 @@ impl Cache {
                 state.put_raw(key, value);
             } else {
                 state.delete(key);
+            }
+        }
+
+        for (key, value) in self.unwritten_bytes_changes {
+            if let Some(value) = value {
+                state.put_raw_bytes(key, value);
+            } else {
+                state.delete_bytes(key);
             }
         }
 
@@ -77,6 +100,7 @@ impl Cache {
     /// Returns `true` if there are cached writes on top of the snapshot, and `false` otherwise.
     pub fn is_dirty(&self) -> bool {
         !(self.unwritten_changes.is_empty()
+            && self.unwritten_bytes_changes.is_empty()
             && self.nonverifiable_changes.is_empty()
             && self.ephemeral_objects.is_empty())
     }
@@ -103,6 +127,15 @@ impl Cache {
                 .insert(truncated_key.to_string(), some_value);
         }
 
+        for (key, some_value) in self.unwritten_bytes_changes {
+            let (truncated_key, substore_config) = prefixes.route_key_bytes(&key);
+            changes_by_substore
+                .entry(substore_config)
+                .or_insert_with(Cache::default)
+                .unwritten_bytes_changes
+                .insert(truncated_key.to_vec(), some_value);
+        }
+
         for (key, some_value) in self.nonverifiable_changes {
             let (truncated_key, substore_config) = prefixes.route_key_bytes(&key);
             changes_by_substore
@@ -117,6 +150,7 @@ impl Cache {
     pub(crate) fn clone_changes(&self) -> Self {
         Self {
             unwritten_changes: self.unwritten_changes.clone(),
+            unwritten_bytes_changes: self.unwritten_bytes_changes.clone(),
             nonverifiable_changes: self.nonverifiable_changes.clone(),
             ephemeral_objects: Default::default(),
             events: Default::default(),
